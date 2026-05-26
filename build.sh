@@ -574,6 +574,9 @@ build_kernel() {
         scripts/config --enable LOGO || true
         scripts/config --enable LOGO_LINUX_CLUT224 || true
 
+        # TUN/TAP virtual network device. Required for /dev/net/tun for tailscale
+        scripts/config --enable TUN || true
+
         if [ "${RKDEBIAN_GPU_STACK}" = "panfrost" ]; then
             echo "[*] Applying panfrost kernel config overrides..."
             scripts/config --enable DRM_PANFROST || true
