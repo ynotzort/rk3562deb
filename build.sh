@@ -577,6 +577,14 @@ build_kernel() {
         # TUN/TAP virtual network device. Required for /dev/net/tun for tailscale
         scripts/config --enable TUN || true
 
+        # Netfilter for Tailscale. 
+        scripts/config --enable NF_CONNTRACK || true
+        scripts/config --enable NF_TABLES || true
+        scripts/config --enable NF_TABLES_IPV4 || true
+        scripts/config --enable NFT_CT || true
+        scripts/config --enable NFT_NAT || true
+        scripts/config --enable NFT_MASQ || true
+
         if [ "${RKDEBIAN_GPU_STACK}" = "panfrost" ]; then
             echo "[*] Applying panfrost kernel config overrides..."
             scripts/config --enable DRM_PANFROST || true
