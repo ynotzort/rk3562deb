@@ -13,10 +13,16 @@ OUTPUT_DIR="${ROOT_DIR}/output"
 # Versions & URLs
 UBOOT_URL="https://github.com/Firefly-rk-linux/u-boot.git"
 UBOOT_BRANCH="rk356x/firefly-5.10"
+# Pin U-Boot: known-booting commit for RK3562
+UBOOT_COMMIT="${RKDEBIAN_UBOOT_COMMIT:-30d6e6f55d2b943c0910c3f69ccf4d302272ee71}"
 KERNEL_URL="https://github.com/rockchip-linux/kernel.git"
 KERNEL_BRANCH="develop-6.1"
+# Pin kernel: known-booting commit for RK3562 tablet (closes issue #12)
+KERNEL_COMMIT="${RKDEBIAN_KERNEL_COMMIT:-8c290990fe7b45fc7ee8ee0896fddf822ac02b54}"
 RKBIN_URL="https://github.com/rockchip-linux/rkbin.git"
 RKBIN_BRANCH="master"
+# Pin rkbin: commit known to contain working v1.07 DDR controller blob for RK3562
+RKBIN_COMMIT="${RKDEBIAN_RKBIN_COMMIT:-167d377195bfd956d679027b742bad9a68ceb726}"
 
 # RK3562 configs
 UBOOT_DEFCONFIG="rk3562_defconfig"
@@ -25,7 +31,7 @@ KERNEL_DTB="rk3562-rk817-tablet-v10.dtb"
 KERNEL_DTB_PANFROST="rk3562-rk817-tablet-v10-panfrost.dtb"
 RKDEBIAN_DISPLAY_SERVER="${RKDEBIAN_DISPLAY_SERVER:-wayland}"
 RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION:-phosh}"
-RKDEBIAN_GPU_STACK="${RKDEBIAN_GPU_STACK:-mali}"
+RKDEBIAN_GPU_STACK="${RKDEBIAN_GPU_STACK:-panfrost}"
 RKDEBIAN_CPU_GOVERNOR="${RKDEBIAN_CPU_GOVERNOR:-performance}"
 RKDEBIAN_FORCE_CLEAN_ROOTFS="${RKDEBIAN_FORCE_CLEAN_ROOTFS:-0}"
 
@@ -285,7 +291,7 @@ EOF
 
 check_deps() {
     echo "[*] Checking dependencies..."
-    local deps=("git" "make" "aarch64-linux-gnu-gcc" "bc" "bison" "flex" "dtc" "genimage" "wget" "tar" "mcopy" "debootstrap" "qemu-aarch64-static" "mkfs.ext4" "e2fsck" "xz")
+    local deps=("git" "make" "aarch64-linux-gnu-gcc" "bc" "bison" "flex" "dtc" "genimage" "wget" "tar" "mcopy" "debootstrap" "qemu-aarch64-static" "mkfs.ext4" "e2fsck" "xz" "mkdosfs")
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" >/dev/null 2>&1; then
             echo "[-] Error: Missing dependency: $dep. Please install it."
@@ -341,8 +347,10 @@ cleanup_stale_rootfs_mounts() {
         fi
 
         if [ "${EUID}" -eq 0 ]; then
+            mount --make-rslave "${mount_path}" 2>/dev/null || true
             umount -l "${mount_path}" 2>/dev/null || true
         else
+            sudo mount --make-rslave "${mount_path}" 2>/dev/null || true
             sudo umount -l "${mount_path}" 2>/dev/null || true
         fi
     done < <(
@@ -384,19 +392,92 @@ run_build_rootfs() {
     fi
 }
 
+apply_local_uboot_patches() {
+    local patch_file="${ROOT_DIR}/patches/0001-u-boot-make.sh-only-require-python2-for-legacy-generators.patch"
+
+    if [ ! -f "${patch_file}" ]; then
+        return 0
+    fi
+
+    echo "[*] Checking local U-Boot patch: $(basename "${patch_file}")"
+    if git apply --check "${patch_file}" >/dev/null 2>&1; then
+        git apply "${patch_file}"
+        echo "[+] Applied local U-Boot patch."
+    elif git apply -R --check "${patch_file}" >/dev/null 2>&1; then
+        echo "[*] Local U-Boot patch already applied."
+    else
+        echo "[-] Error: unable to apply local U-Boot patch."
+        echo "    Patch: ${patch_file}"
+        echo "    Hint: ensure u-boot/make.sh matches expected base or apply manually."
+        exit 1
+    fi
+}
+
 build_uboot() {
     echo "[*] Building U-Boot..."
     cd "${SRC_DIR}"
     
     if [ ! -d "rkbin" ]; then
-        git clone --depth 1 -b ${RKBIN_BRANCH} ${RKBIN_URL} rkbin
+        if [ -n "${RKBIN_COMMIT}" ]; then
+            git clone -b "${RKBIN_BRANCH}" "${RKBIN_URL}" rkbin
+        else
+            git clone --depth 1 -b "${RKBIN_BRANCH}" "${RKBIN_URL}" rkbin
+        fi
     fi
     
     if [ ! -d "u-boot" ]; then
-        git clone --depth 1 -b ${UBOOT_BRANCH} ${UBOOT_URL} u-boot
+        if [ -n "${UBOOT_COMMIT}" ]; then
+            git clone -b "${UBOOT_BRANCH}" "${UBOOT_URL}" u-boot
+        else
+            git clone --depth 1 -b "${UBOOT_BRANCH}" "${UBOOT_URL}" u-boot
+        fi
+    fi
+
+    # rkbin ownership repair so boot_merger doesn't fail with EACCES (err=13)
+    if [ "${EUID}" -ne 0 ] && [ -d "${SRC_DIR}/rkbin" ]; then
+        local rkbin_foreign=""
+        rkbin_foreign=$(find "${SRC_DIR}/rkbin" -maxdepth 2 \( ! -uid "$(id -u)" -o ! -gid "$(id -g)" \) -print -quit 2>/dev/null || true)
+        if [ -n "${rkbin_foreign}" ]; then
+            echo "[*] Repairing rkbin tree ownership..."
+            sudo chown -R "$(id -u):$(id -g)" "${SRC_DIR}/rkbin"
+        fi
+    fi
+
+    if [ -n "${RKBIN_COMMIT}" ] && [ -d "${SRC_DIR}/rkbin/.git" ]; then
+        cd "${SRC_DIR}/rkbin"
+        if git cat-file -e "${RKBIN_COMMIT}^{commit}" 2>/dev/null; then
+            if [ "$(git rev-parse HEAD)" != "${RKBIN_COMMIT}" ]; then
+                echo "[*] Pinning rkbin to ${RKBIN_COMMIT}..."
+                git checkout -q --detach "${RKBIN_COMMIT}" || {
+                    echo "[-] Error: could not check out pinned rkbin commit."; exit 1; }
+            fi
+        else
+            echo "[!] Pinned rkbin commit ${RKBIN_COMMIT} not present in this clone. Fetching..."
+            git fetch --unshallow origin 2>/dev/null || git fetch origin || true
+            git checkout -q --detach "${RKBIN_COMMIT}" || {
+                echo "[-] Error: pinned rkbin commit unavailable; delete src/rkbin and retry."; exit 1; }
+        fi
+        echo "[*] rkbin at commit: $(git rev-parse --short HEAD)"
+        cd - >/dev/null
     fi
     
     cd u-boot
+
+    if [ -n "${UBOOT_COMMIT}" ]; then
+        if git cat-file -e "${UBOOT_COMMIT}^{commit}" 2>/dev/null; then
+            if [ "$(git rev-parse HEAD)" != "${UBOOT_COMMIT}" ]; then
+                echo "[*] Pinning U-Boot to ${UBOOT_COMMIT}..."
+                git checkout -q --detach "${UBOOT_COMMIT}" || {
+                    echo "[-] Error: could not check out pinned U-Boot commit."; exit 1; }
+            fi
+        else
+            echo "[!] Pinned U-Boot commit ${UBOOT_COMMIT} not present in this clone. Fetching..."
+            git fetch --unshallow origin 2>/dev/null || git fetch origin || true
+            git checkout -q --detach "${UBOOT_COMMIT}" || {
+                echo "[-] Error: pinned U-Boot commit unavailable; delete src/u-boot and retry."; exit 1; }
+        fi
+    fi
+    echo "[*] U-Boot at commit: $(git rev-parse --short HEAD)"
 
     if [ "${EUID}" -ne 0 ]; then
         local foreign_owner=""
@@ -406,20 +487,42 @@ build_uboot() {
             sudo chown -R "$(id -u):$(id -g)" .
         fi
     fi
+
+    apply_local_uboot_patches
     
     export KCFLAGS="-Wno-error"
     ABS_CROSS_COMPILE=$(dirname $(command -v aarch64-linux-gnu-gcc))"/aarch64-linux-gnu-"
     ./make.sh rk3562 CROSS_COMPILE=${ABS_CROSS_COMPILE}
     
+    # Generate BootROM-parseable idblock (RKNS magic) for SD/eMMC boot
+    ./make.sh --idblock 2>/dev/null || true
+    
     # Store artifacts
-    local spl_loader
-    spl_loader=$(ls -1 rk3562_spl_loader_*.bin 2>/dev/null | head -n1 || true)
+    local spl_loader=""
+    if [ -f "idblock.bin" ]; then
+        spl_loader="idblock.bin"
+    elif [ -f "idblock.img" ]; then
+        spl_loader="idblock.img"
+    elif ls -1 rk3562_spl_loader_*.bin 2>/dev/null | head -n1 >/dev/null; then
+        spl_loader=$(ls -1 rk3562_spl_loader_*.bin 2>/dev/null | head -n1)
+    elif ls -1 rk3562_loader_*.bin 2>/dev/null | head -n1 >/dev/null; then
+        spl_loader=$(ls -1 rk3562_loader_*.bin 2>/dev/null | head -n1)
+    fi
+
     if [ -z "${spl_loader}" ]; then
-        echo "[-] Error: rk3562_spl_loader_*.bin not found in U-Boot output."
+        echo "[-] Error: no valid loader or idblock found in U-Boot output."
         exit 1
     fi
 
-    cp "${spl_loader}" "${OUT_DIR}/idbloader.img"
+    local magic=""
+    magic=$(head -c 4 "${spl_loader}" 2>/dev/null || true)
+    if [ "${magic}" = "RKNS" ] || [ "${magic}" = "RK35" ] || [ "${magic}" = "LDR " ]; then
+        echo "[+] Using loader artifact: ${spl_loader} (magic: ${magic})"
+        cp "${spl_loader}" "${OUT_DIR}/idbloader.img"
+    else
+        echo "[+] Using loader artifact: ${spl_loader}"
+        cp "${spl_loader}" "${OUT_DIR}/idbloader.img"
+    fi
     cp uboot.img "${OUT_DIR}/u-boot.itb"
     
     echo "[+] U-Boot build complete."
@@ -431,10 +534,30 @@ build_kernel() {
     cd "${SRC_DIR}"
     
     if [ ! -d "kernel" ]; then
-        git clone --depth 1 -b ${KERNEL_BRANCH} ${KERNEL_URL} kernel
+        if [ -n "${KERNEL_COMMIT}" ]; then
+            git clone -b "${KERNEL_BRANCH}" "${KERNEL_URL}" kernel
+        else
+            git clone --depth 1 -b "${KERNEL_BRANCH}" "${KERNEL_URL}" kernel
+        fi
     fi
 
     cd kernel
+
+    if [ -n "${KERNEL_COMMIT}" ]; then
+        if git cat-file -e "${KERNEL_COMMIT}^{commit}" 2>/dev/null; then
+            if [ "$(git rev-parse HEAD)" != "${KERNEL_COMMIT}" ]; then
+                echo "[*] Pinning kernel to ${KERNEL_COMMIT}..."
+                git checkout -q --detach "${KERNEL_COMMIT}" || {
+                    echo "[-] Error: could not check out pinned kernel commit."; exit 1; }
+            fi
+        else
+            echo "[!] Pinned kernel commit ${KERNEL_COMMIT} not present in this clone. Fetching..."
+            git fetch --unshallow origin 2>/dev/null || git fetch origin || true
+            git checkout -q --detach "${KERNEL_COMMIT}" || {
+                echo "[-] Error: pinned kernel commit unavailable; delete src/kernel and retry."; exit 1; }
+        fi
+        echo "[*] Kernel at commit: $(git rev-parse --short HEAD)"
+    fi
 
     if [ "${EUID}" -ne 0 ]; then
         local foreign_owner=""
@@ -469,7 +592,6 @@ build_kernel() {
             local pmic_overlay_files=(
                 "drivers/mfd/rk808.c"
                 "drivers/power/supply/rk817_battery.c"
-                "drivers/power/supply/rk817_charger.c"
             )
 
             if [ "${RKDEBIAN_KEEP_OVERLAY_PMIC_PATCHES:-0}" = "1" ]; then
@@ -519,6 +641,53 @@ build_kernel() {
         fi
     fi
 
+    # RK817 charger VBUS presence safety fix:
+    # prevent enabling OTG 5V boost when external VBUS is already present,
+    # avoiding reverse-current / overvoltage shutdown reboot when connecting charger.
+    local rk817_charger_safety_patch="${ROOT_DIR}/overlay/kernel-patches/rk817-charger-vbus-safety.patch"
+    if [ -f "${rk817_charger_safety_patch}" ]; then
+        if grep -q "USB host mode with external VBUS present" drivers/power/supply/rk817_charger.c; then
+            echo "[*] RK817 charger VBUS safety fix already present."
+        else
+            echo "[*] Applying RK817 charger VBUS safety fix..."
+            if ! git apply --whitespace=nowarn "${rk817_charger_safety_patch}"; then
+                echo "[-] Error: failed to apply RK817 charger VBUS safety fix."
+                exit 1
+            fi
+        fi
+    fi
+
+    # RK8xx clkout platform ID match fix:
+    # ensure "rk817-clkout" etc. subdevices match the clk driver ID table
+    local rk8xx_clkout_patch="${ROOT_DIR}/overlay/kernel-patches/rk8xx-clkout-name-match.patch"
+    if [ -f "${rk8xx_clkout_patch}" ]; then
+        if grep -q "rk817-clkout" drivers/clk/clk-rk808.c; then
+            echo "[*] RK8xx clkout name match fix already present."
+        else
+            echo "[*] Applying RK8xx clkout name match fix..."
+            if ! git apply --whitespace=nowarn "${rk8xx_clkout_patch}"; then
+                echo "[-] Error: failed to apply RK8xx clkout name match fix."
+                exit 1
+            fi
+        fi
+    fi
+
+    # Panfrost RK3562 clock fix:
+    # ensure Panfrost enables all supplementary AXI/APB clocks defined in the DTS
+    # otherwise early GPU initialization causes a bus fault / black screen on boot.
+    local panfrost_clocks_patch="${ROOT_DIR}/overlay/kernel-patches/panfrost-rk3562-clocks.patch"
+    if [ -f "${panfrost_clocks_patch}" ]; then
+        if grep -q "extra_clocks" drivers/gpu/drm/panfrost/panfrost_device.c; then
+            echo "[*] Panfrost RK3562 clocks fix already present."
+        else
+            echo "[*] Applying Panfrost RK3562 clocks fix..."
+            if ! git apply --whitespace=nowarn "${panfrost_clocks_patch}"; then
+                echo "[-] Error: failed to apply Panfrost RK3562 clocks fix."
+                exit 1
+            fi
+        fi
+    fi
+
     # Use the configured defconfig, with a rockchip fallback if needed.
     if [ ! -f "arch/arm64/configs/${KERNEL_DEFCONFIG}" ]; then
         echo "Warning: ${KERNEL_DEFCONFIG} not found. Attempting rockchip_linux_defconfig..."
@@ -551,6 +720,8 @@ build_kernel() {
         scripts/config --disable WLAN_VENDOR_SEEKWAVE || true
         scripts/config --module WLAN_VENDOR_SWT6621S || true
         scripts/config --module SKW_BT || true
+        # Enable MacroSilicon MS91xx USB Display DRM Driver
+        scripts/config --module DRM_MSDISP || true
         # Enable Rockchip sensor framework before selecting accel drivers.
         scripts/config --enable SENSOR_DEVICE || true
         scripts/config --enable GSENSOR_DEVICE || true
@@ -573,6 +744,30 @@ build_kernel() {
         scripts/config --enable FRAMEBUFFER_CONSOLE || true
         scripts/config --enable LOGO || true
         scripts/config --enable LOGO_LINUX_CLUT224 || true
+        # Enable binfmt_misc for transparent x86/x86_64 emulation (FEX-Emu / box64).
+        scripts/config --enable BINFMT_MISC || true
+        # Enable container and networking support (Docker / K3s / containerd).
+        scripts/config --enable MEMCG || true
+        scripts/config --enable CGROUP_PIDS || true
+        scripts/config --enable BLK_CGROUP || true
+        scripts/config --enable POSIX_MQUEUE || true
+        scripts/config --enable OVERLAY_FS || true
+        scripts/config --enable VETH || true
+        scripts/config --enable BRIDGE || true
+        scripts/config --enable BRIDGE_NETFILTER || true
+        scripts/config --enable NETFILTER_XT_MATCH_ADDRTYPE || true
+        scripts/config --enable NETFILTER_XT_MATCH_CONNTRACK || true
+        scripts/config --enable NETFILTER_XT_MATCH_COMMENT || true
+        scripts/config --enable NETFILTER_XT_MATCH_IPVS || true
+        scripts/config --enable NETFILTER_XT_MARK || true
+        scripts/config --enable IP_NF_FILTER || true
+        scripts/config --enable IP_NF_NAT || true
+        scripts/config --enable NF_NAT || true
+        scripts/config --enable IP_NF_TARGET_MASQUERADE || true
+        scripts/config --enable IP_NF_TARGET_REDIRECT || true
+        scripts/config --enable IP6_NF_FILTER || true
+        scripts/config --enable IP6_NF_NAT || true
+        scripts/config --enable IP6_NF_TARGET_MASQUERADE || true
 
         # TUN/TAP virtual network device. Required for /dev/net/tun for tailscale
         scripts/config --enable TUN || true
@@ -699,6 +894,11 @@ create_image() {
     # - override: ROOTFS_IMAGE_SIZE=<size> (examples: 4G, 3584M)
     # The rootfs is expanded on first boot by expand-rootfs.service, so we keep
     # the build artifact compact while preserving enough installation headroom.
+    local SUDO_CMD=""
+    if [ "${EUID}" -ne 0 ]; then
+        SUDO_CMD="sudo "
+    fi
+
     local rootfs_image_size="${ROOTFS_IMAGE_SIZE:-auto}"
     if [ "${rootfs_image_size}" = "auto" ]; then
         local rootfs_used_bytes reserve_bytes min_bytes align_bytes size_bytes
@@ -711,7 +911,7 @@ create_image() {
         case "${min_mb}" in
             ''|*[!0-9]*) min_mb=2560 ;;
         esac
-        rootfs_used_bytes=$(sudo du -s -B1 "${OUT_DIR}/rootfs" | awk '{print $1}')
+        rootfs_used_bytes=$(${SUDO_CMD}du -s -B1 "${OUT_DIR}/rootfs" | awk '{print $1}')
         reserve_bytes=$((reserve_mb * 1024 * 1024))
         min_bytes=$((min_mb * 1024 * 1024))
         align_bytes=$((64 * 1024 * 1024))       # align to 64 MiB
@@ -729,10 +929,139 @@ create_image() {
 
     # NetworkManager refuses non-root-owned device plugins; fix ownership in
     # source rootfs before packing the final image.
-    sudo find "${OUT_DIR}/rootfs/usr/lib" -type f -path '*/NetworkManager/*/libnm-*.so' \
+    ${SUDO_CMD}find "${OUT_DIR}/rootfs/usr/lib" -type f -path '*/NetworkManager/*/libnm-*.so' \
         -exec chown root:root {} + 2>/dev/null || true
 
-    sudo mkfs.ext4 -F \
+    # Ensure chassis is tablet so Phosh doesn't force portrait on lock/sleep (issue #7)
+    if [ -d "${OUT_DIR}/rootfs/etc" ]; then
+        if ! grep -q "CHASSIS=tablet" "${OUT_DIR}/rootfs/etc/machine-info" 2>/dev/null; then
+            echo "CHASSIS=tablet" | ${SUDO_CMD}tee -a "${OUT_DIR}/rootfs/etc/machine-info" >/dev/null
+        fi
+
+        # Sync Chromium hardware acceleration flags if VA-API driver is present
+        if [ -f "${OUT_DIR}/rootfs/usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so" ]; then
+            ${SUDO_CMD}mkdir -p "${OUT_DIR}/rootfs/etc/chromium.d"
+            ${SUDO_CMD}mkdir -p "${OUT_DIR}/rootfs/usr/share/chromium/extensions/block-av1"
+            cat << 'BLOCK_AV1_MANIFEST' | ${SUDO_CMD}tee "${OUT_DIR}/rootfs/usr/share/chromium/extensions/block-av1/manifest.json" >/dev/null
+{
+  "name": "Block AV1 for Hardware VP9",
+  "version": "1.0",
+  "manifest_version": 3,
+  "description": "Blocks software AV1 decode so hardware VP9 is used",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["block_av1.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
+BLOCK_AV1_MANIFEST
+            cat << 'BLOCK_AV1_JS' | ${SUDO_CMD}tee "${OUT_DIR}/rootfs/usr/share/chromium/extensions/block-av1/block_av1.js" >/dev/null
+(function() {
+  if (window.MediaSource && window.MediaSource.isTypeSupported) {
+    var origIsTypeSupported = window.MediaSource.isTypeSupported.bind(window.MediaSource);
+    window.MediaSource.isTypeSupported = function(type) {
+      if (typeof type === 'string' && (type.toLowerCase().includes('av01') || type.toLowerCase().includes('av1'))) {
+        return false;
+      }
+      return origIsTypeSupported(type);
+    };
+  }
+  if (window.HTMLMediaElement && window.HTMLMediaElement.prototype.canPlayType) {
+    var origCanPlayType = window.HTMLMediaElement.prototype.canPlayType;
+    window.HTMLMediaElement.prototype.canPlayType = function(type) {
+      if (typeof type === 'string' && (type.toLowerCase().includes('av01') || type.toLowerCase().includes('av1'))) {
+        return '';
+      }
+      return origCanPlayType.apply(this, arguments);
+    };
+  }
+  if (navigator.mediaCapabilities && navigator.mediaCapabilities.decodingInfo) {
+    var origDecodingInfo = navigator.mediaCapabilities.decodingInfo.bind(navigator.mediaCapabilities);
+    navigator.mediaCapabilities.decodingInfo = function(config) {
+      if (config && config.video && config.video.contentType) {
+        var ct = config.video.contentType.toLowerCase();
+        if (ct.includes('av01') || ct.includes('av1')) {
+          return Promise.resolve({
+            supported: false,
+            smooth: false,
+            powerEfficient: false
+          });
+        }
+      }
+      return origDecodingInfo(config);
+    };
+  }
+
+  // Tablet touch usability: Tap on whitespace/background blurs active input to dismiss OSK
+  function handleTapOutside(e) {
+    var active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+      if (!e.target.closest('input, textarea, [contenteditable="true"], select, button, a, [role="button"]')) {
+        active.blur();
+      }
+    }
+  }
+  document.addEventListener('pointerdown', handleTapOutside, true);
+  document.addEventListener('touchstart', handleTapOutside, true);
+})();
+BLOCK_AV1_JS
+            ${SUDO_CMD}chmod -R 755 "${OUT_DIR}/rootfs/usr/share/chromium/extensions/block-av1"
+
+            cat << 'CHROMIUM_HW_SYNC' | ${SUDO_CMD}tee "${OUT_DIR}/rootfs/etc/chromium.d/rk3562-hw-accel" >/dev/null
+# RK3562 hardware acceleration — sourced by /usr/bin/chromium wrapper
+export LIBVA_DRIVER_NAME=rockchip
+export LIBVA_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ozone-platform=wayland"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --render-node-override=/dev/dri/renderD128"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --hardware-video-device-path=/dev/dri/renderD128"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-vulkan"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-compositing"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --password-store=basic"
+
+# Enable VA-API Hardware Video Decode & Encode
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ignore-gpu-blocklist"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-accelerated-video-decode"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-accelerated-video-encode"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,VaapiIgnoreDriverChecks,VaapiVideoEncoder,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL,AcceleratedVideoEncoder,UseOzonePlatform,WebRtcPipeWireCamera"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-features=UseChromeOSDirectVideoDecoder,Vulkan"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --load-extension=/usr/share/chromium/extensions/block-av1"
+CHROMIUM_HW_SYNC
+        fi
+
+        # Sync global VA-API environment defaults
+        if [ -f "${OUT_DIR}/rootfs/etc/environment" ]; then
+            for env_var in "LIBVA_DRIVER_NAME=rockchip" "LIBVA_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri"; do
+                var_key="${env_var%%=*}"
+                if ! grep -q "^${var_key}=" "${OUT_DIR}/rootfs/etc/environment" 2>/dev/null; then
+                    echo "${env_var}" | ${SUDO_CMD}tee -a "${OUT_DIR}/rootfs/etc/environment" >/dev/null
+                fi
+            done
+        fi
+
+        # Sync tablet dock controller and uinput permissions
+        if [ -f "${ROOT_DIR}/overlay/99-uinput.rules" ] && [ -d "${OUT_DIR}/rootfs/etc/udev/rules.d" ]; then
+            ${SUDO_CMD}cp "${ROOT_DIR}/overlay/99-uinput.rules" "${OUT_DIR}/rootfs/etc/udev/rules.d/99-uinput.rules"
+            ${SUDO_CMD}chmod 0644 "${OUT_DIR}/rootfs/etc/udev/rules.d/99-uinput.rules"
+        fi
+        if [ -f "${ROOT_DIR}/overlay/tablet-dock-pad.py" ] && [ -f "${ROOT_DIR}/overlay/dock-mode.sh" ]; then
+            ${SUDO_CMD}cp "${ROOT_DIR}/overlay/tablet-dock-pad.py" "${OUT_DIR}/rootfs/usr/local/bin/tablet-dock-pad.py"
+            ${SUDO_CMD}cp "${ROOT_DIR}/overlay/dock-mode.sh" "${OUT_DIR}/rootfs/usr/local/bin/dock-mode.sh"
+            ${SUDO_CMD}chmod 0755 "${OUT_DIR}/rootfs/usr/local/bin/tablet-dock-pad.py" "${OUT_DIR}/rootfs/usr/local/bin/dock-mode.sh"
+        fi
+        if [ -f "${ROOT_DIR}/overlay/tablet-dock.desktop" ]; then
+            ${SUDO_CMD}cp "${ROOT_DIR}/overlay/tablet-dock.desktop" "${OUT_DIR}/rootfs/usr/share/applications/tablet-dock.desktop"
+            ${SUDO_CMD}chmod 0644 "${OUT_DIR}/rootfs/usr/share/applications/tablet-dock.desktop"
+            if [ -d "${OUT_DIR}/rootfs/home/chaos/.local/share/applications" ]; then
+                ${SUDO_CMD}cp "${ROOT_DIR}/overlay/tablet-dock.desktop" "${OUT_DIR}/rootfs/home/chaos/.local/share/applications/tablet-dock.desktop"
+            fi
+        fi
+    fi
+
+    ${SUDO_CMD}mkfs.ext4 -F \
         -L rootfs \
         -U c0ffee11-2233-4455-6677-8899aabbccdd \
         -d "${OUT_DIR}/rootfs" \
@@ -741,9 +1070,9 @@ create_image() {
         "${OUT_DIR}/rootfs.ext4"
 
     # Keep a bit more usable free space on small images.
-    sudo tune2fs -m 1 "${OUT_DIR}/rootfs.ext4" >/dev/null 2>&1 || true
+    ${SUDO_CMD}tune2fs -m 1 "${OUT_DIR}/rootfs.ext4" >/dev/null 2>&1 || true
 
-    if ! sudo e2fsck -pf "${OUT_DIR}/rootfs.ext4"; then
+    if ! ${SUDO_CMD}e2fsck -pf "${OUT_DIR}/rootfs.ext4"; then
         echo "[-] Error: rootfs.ext4 consistency check failed."
         exit 1
     fi
@@ -754,7 +1083,7 @@ create_image() {
     local empty_rootpath="${OUT_DIR}/empty_rootpath"
     rm -rf "${empty_rootpath}"
     mkdir -p "${empty_rootpath}"
-    sudo genimage \
+    ${SUDO_CMD}genimage \
         --config "${ROOT_DIR}/genimage.cfg" \
         --rootpath "${empty_rootpath}" \
         --tmppath "${OUT_DIR}/tmp" \

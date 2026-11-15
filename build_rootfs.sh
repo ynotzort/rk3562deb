@@ -22,10 +22,10 @@ ROOTFS_MNT="${OUT_DIR}/rootfs"
 MODULES_DIR="${OUT_DIR}/modules_staging/lib/modules"
 RKDEBIAN_DISPLAY_SERVER="${RKDEBIAN_DISPLAY_SERVER:-wayland}"
 RKDEBIAN_CPU_GOVERNOR="${RKDEBIAN_CPU_GOVERNOR:-performance}"
-RKDEBIAN_GPU_STACK="${RKDEBIAN_GPU_STACK:-mali}"
+RKDEBIAN_GPU_STACK="${RKDEBIAN_GPU_STACK:-panfrost}"
 RKDEBIAN_UI_SESSION="${RKDEBIAN_UI_SESSION:-phosh}"
 RKDEBIAN_MALI_GBM_PROVIDER="${RKDEBIAN_MALI_GBM_PROVIDER:-vendor}"
-RKDEBIAN_PREINSTALL_FREETUBE="${RKDEBIAN_PREINSTALL_FREETUBE:-1}"
+RKDEBIAN_PREINSTALL_FREETUBE="${RKDEBIAN_PREINSTALL_FREETUBE:-0}"
 RKDEBIAN_MINIMIZE_IMAGE="${RKDEBIAN_MINIMIZE_IMAGE:-0}"
 
 case "${RKDEBIAN_DISPLAY_SERVER}" in
@@ -99,6 +99,7 @@ chroot_cleanup() {
             cleaned=1
         fi
 
+        mount --make-rslave "${mount_path}" 2>/dev/null || true
         umount -l "${mount_path}" 2>/dev/null || true
     done < <(
         findmnt -rn -o TARGET 2>/dev/null \
@@ -143,11 +144,13 @@ fi
 
 # 2. Setup chroot mounts
 echo "[*] Setting up chroot mounts..."
-mkdir -p "${ROOTFS_MNT}/proc" "${ROOTFS_MNT}/sys" "${ROOTFS_MNT}/dev/pts"
-mount --bind /proc    "${ROOTFS_MNT}/proc"
-mount --bind /sys     "${ROOTFS_MNT}/sys"
-mount --bind /dev     "${ROOTFS_MNT}/dev"
-mount --bind /dev/pts "${ROOTFS_MNT}/dev/pts"
+mkdir -p "${ROOTFS_MNT}/proc" "${ROOTFS_MNT}/sys" "${ROOTFS_MNT}/dev"
+mount --rbind /proc    "${ROOTFS_MNT}/proc"
+mount --make-rslave    "${ROOTFS_MNT}/proc"
+mount --rbind /sys     "${ROOTFS_MNT}/sys"
+mount --make-rslave    "${ROOTFS_MNT}/sys"
+mount --rbind /dev     "${ROOTFS_MNT}/dev"
+mount --make-rslave    "${ROOTFS_MNT}/dev"
 rm -f "${ROOTFS_MNT}/etc/resolv.conf"
 cp /etc/resolv.conf "${ROOTFS_MNT}/etc/resolv.conf"
 
@@ -195,7 +198,7 @@ apt-get -f install -y || \
     echo "[!] Warning: apt dependency repair failed; continuing with base package install."
 apt-get install -y sudo curl wget nano vim openssh-server network-manager wpasupplicant iw wireless-tools \
     network-manager-gnome bluez blueman \
-    xorg xserver-xorg xserver-xorg-input-libinput firefox-esr mesa-utils libgl1-mesa-dri mesa-vulkan-drivers \
+    xorg xserver-xorg xserver-xorg-input-libinput mesa-utils libgl1-mesa-dri mesa-vulkan-drivers mesa-opencl-icd vulkan-tools \
     pipewire pipewire-audio pipewire-alsa pipewire-pulse wireplumber pavucontrol alsa-utils libasound2-plugins \
     pipewire-libcamera libcamera-ipa libcamera-v4l2 \
     gedit \
@@ -326,7 +329,7 @@ if command -v flatpak >/dev/null 2>&1; then
             echo "[!] Warning: failed to add Flathub remote."
 
     # Keep heavy Flatpak apps optional to avoid inflating default image size.
-    RKDEBIAN_PREINSTALL_FREETUBE="${RKDEBIAN_PREINSTALL_FREETUBE:-1}"
+    RKDEBIAN_PREINSTALL_FREETUBE="${RKDEBIAN_PREINSTALL_FREETUBE:-0}"
     freetube_ref="io.freetubeapp.FreeTube"
     if [ "${RKDEBIAN_PREINSTALL_FREETUBE}" = "1" ]; then
         if flatpak remote-info --system flathub "${freetube_ref}" >/dev/null 2>&1; then
@@ -441,22 +444,30 @@ auto lo
 iface lo inet loopback
 IFACES
 
-# Default Phosh WWAN backend away from ModemManager on non-cellular hardware.
+# Default Phosh WWAN backend and fast OSK bottom-bar toggle.
 mkdir -p /etc/dconf/db/local.d
 cat > /etc/dconf/db/local.d/20-rkdebian-phosh-wwan << 'PHOSH_WWAN_DCONF'
 [sm/puri/phosh]
 wwan-backend='ofono'
+osk-unfold-delay=0.5
 PHOSH_WWAN_DCONF
 
-# Keep lockscreen enabled by default.
-# (Older images disabled it as a temporary portrait-workaround.)
+# Keep lockscreen enabled by default with on-screen keyboard enabled.
 cat > /etc/dconf/db/local.d/21-rkdebian-phosh-lockscreen << 'PHOSH_LOCK_DCONF'
 [org/gnome/desktop/screensaver]
 lock-enabled=true
 
 [org/gnome/desktop/lockdown]
 disable-lock-screen=false
+
+[org/gnome/desktop/a11y/applications]
+screen-keyboard-enabled=true
+
+[sm/puri/phosh/lockscreen]
+shuffle-keypad=false
+require-unlock=true
 PHOSH_LOCK_DCONF
+
 
 # Disable GSD power-button actions so logind + custom long-press handler own
 # power-key policy without duplicate actions.
@@ -473,12 +484,8 @@ else
     printf '\n[Policy]\nAutoEnable=true\n' >> /etc/bluetooth/main.conf
 fi
 
-# Firefox launcher defaults for RK3562: prefer native Wayland + VAAPI and
-# neutralize stale MOZ_X11_EGL values inherited from login environments.
-if [ -f /usr/share/applications/firefox-esr.desktop ]; then
-    sed -i -E 's|^Exec=.*firefox-esr.*$|Exec=env -u MOZ_X11_EGL MOZ_DISABLE_RDD_SANDBOX=1 MOZ_ENABLE_WAYLAND=1 MOZ_WAYLAND_USE_VAAPI=1 MOZ_DRM_DEVICE=/dev/dri/renderD128 LIBVA_DRIVER_NAME=rockchip /usr/lib/firefox-esr/firefox-esr %u|' \
-        /usr/share/applications/firefox-esr.desktop || true
-fi
+# Ensure no stale Firefox launcher remains
+rm -f /usr/share/applications/firefox-esr.desktop 2>/dev/null || true
 
 # Configure a simple boot splash theme.
 if command -v plymouth-set-default-theme >/dev/null 2>&1; then
@@ -491,6 +498,14 @@ for ply_unit in plymouth-start.service plymouth-quit.service plymouth-quit-wait.
         systemctl enable "${ply_unit}" >/dev/null 2>&1 || true
     fi
 done
+
+# Show splash immediately on fast-booting RK3562 images.
+mkdir -p /etc/plymouth
+cat > /etc/plymouth/plymouthd.conf << 'PLYMOUTHD_CONF'
+[Daemon]
+ShowDelay=0
+PLYMOUTHD_CONF
+
 
 CHROOT_EOF
 
@@ -635,6 +650,12 @@ if [ "${RKDEBIAN_GPU_STACK}" = "panfrost" ]; then
           "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libmali-hook.so" \
           "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/libmali-hook.so.1" \
           "${ROOTFS_MNT}/etc/ld.so.conf.d/00-aarch64-mali.conf"
+    # Disable AFBC scanout for Panfrost on RK3562 (avoids crashes in Wayland compositors)
+    touch "${ROOTFS_MNT}/etc/environment"
+    if ! grep -q "PAN_MESA_DEBUG=noafbc" "${ROOTFS_MNT}/etc/environment"; then
+        echo "PAN_MESA_DEBUG=noafbc" >> "${ROOTFS_MNT}/etc/environment"
+    fi
+
     chroot "${ROOTFS_MNT}" ldconfig
 else
     # Mali userspace stack. Default is to keep vendor libgbm as shipped by the
@@ -787,6 +808,15 @@ tee "${ROOTFS_MNT}/etc/udev/rules.d/99-touchscreen-gsl3673.rules" > /dev/null <<
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="gsl3673", ENV{ID_INPUT}="1", ENV{ID_INPUT_TOUCHSCREEN}="1"
 UDEV_TS
 
+tee "${ROOTFS_MNT}/etc/udev/rules.d/65-joystick-fix.rules" > /dev/null << 'UDEV_JOYSTICK'
+# Remove unwanted js* device nodes created by tablet accelerometers
+SUBSYSTEM=="input", KERNEL=="js[0-9]*", ATTRS{name}=="mir3da", RUN+="/bin/rm -f /dev/input/%k"
+SUBSYSTEM=="input", KERNEL=="js[0-9]*", ATTRS{name}=="gsensor", RUN+="/bin/rm -f /dev/input/%k"
+
+# Ensure real gamepads/joysticks are accessible as /dev/input/js0
+SUBSYSTEM=="input", KERNEL=="js[1-9]*", ATTRS{name}!="mir3da", ATTRS{name}!="gsensor", SYMLINK+="input/js0"
+UDEV_JOYSTICK
+
 mkdir -p "${ROOTFS_MNT}/etc/X11/xorg.conf.d"
 cat > "${ROOTFS_MNT}/etc/X11/xorg.conf.d/40-gsl3673-touchscreen.conf" << 'XORG_TS'
 Section "InputClass"
@@ -830,287 +860,92 @@ Section "Device"
 EndSection
 XORG_GPU
 
-# Build rockchip_drv_video.so (Rockchip VAAPI driver) inside the chroot.
-# Sources: sujit-168/rk_hw_base (MPP+RGA middleware) and sujit-168/rk_vaapi_driver.
-# librga prebuilt (aarch64) is pulled from airockchip/librga.
-echo "[*] Building Rockchip VAAPI driver inside chroot..."
-cat > "${ROOTFS_MNT}/tmp/build_vaapi.sh" << 'BUILD_VAAPI_EOF'
+# Install Rockchip VAAPI driver and modern MPP library.
+echo "[*] Installing Rockchip VAAPI driver and MPP runtime..."
+mkdir -p "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/dri"
+mkdir -p "${ROOTFS_MNT}/usr/local/lib"
+mkdir -p "${ROOTFS_MNT}/etc/ld.so.conf.d"
+
+if [ -f "${ROOT_DIR}/prebuilt/vaapi/rockchip_drv_video.so" ] && [ -f "${ROOT_DIR}/prebuilt/vaapi/librockchip_mpp.so.0" ]; then
+    echo "[+] Using verified prebuilt VAAPI driver and modern MPP library..."
+    cp "${ROOT_DIR}/prebuilt/vaapi/rockchip_drv_video.so" "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so"
+    chmod 0755 "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so"
+
+    cp "${ROOT_DIR}/prebuilt/vaapi/librockchip_mpp.so.0" "${ROOTFS_MNT}/usr/local/lib/librockchip_mpp.so.0"
+    chmod 0755 "${ROOTFS_MNT}/usr/local/lib/librockchip_mpp.so.0"
+    ln -sf librockchip_mpp.so.0 "${ROOTFS_MNT}/usr/local/lib/librockchip_mpp.so.1"
+    ln -sf librockchip_mpp.so.0 "${ROOTFS_MNT}/usr/local/lib/librockchip_mpp.so"
+
+    echo "/usr/local/lib" > "${ROOTFS_MNT}/etc/ld.so.conf.d/local.conf"
+    chroot "${ROOTFS_MNT}" ldconfig
+else
+    echo "[!] Prebuilts not found, compiling from source inside chroot..."
+    cat > "${ROOTFS_MNT}/tmp/build_vaapi.sh" << 'BUILD_VAAPI_EOF'
 #!/bin/bash
 set -e
 cd /tmp
-
-# Install build dependencies for VAAPI driver
-mkdir -p /var/cache/man
-if getent passwd man >/dev/null 2>&1; then
-    chown -R man:root /var/cache/man 2>/dev/null || true
-else
-    chown -R root:root /var/cache/man 2>/dev/null || true
-fi
-find /var/cache/man -type d -exec chmod 0755 {} + 2>/dev/null || true
-chmod g+s /var/cache/man 2>/dev/null || true
-find /var/cache/man -type f -exec chmod 0644 {} + 2>/dev/null || true
-
-apt-get install -y --no-install-recommends git build-essential libva-dev libdrm-dev pkg-config
-
-# Install librga prebuilt + headers from airockchip/librga
-if [ ! -f /usr/lib/aarch64-linux-gnu/librga.so ]; then
-    echo "[*] Fetching librga..."
-    git clone --depth=1 https://github.com/airockchip/librga /tmp/librga_src
-    cp /tmp/librga_src/libs/Linux/gcc-aarch64/librga.so /usr/lib/aarch64-linux-gnu/
-    # Create SONAME symlink if the binary has one embedded
-    SONAME=$(objdump -p /usr/lib/aarch64-linux-gnu/librga.so 2>/dev/null | awk '/SONAME/{print $2}')
-    if [ -n "$SONAME" ] && [ "$SONAME" != "librga.so" ]; then
-        ln -sf librga.so "/usr/lib/aarch64-linux-gnu/$SONAME"
-    fi
-    mkdir -p /usr/include/rga
-    cp /tmp/librga_src/include/*.h /usr/include/rga/
-    ldconfig
-    rm -rf /tmp/librga_src
-fi
-
-# Build rk_hw_base middleware
-if [ ! -f /usr/lib/aarch64-linux-gnu/librk_hw_base.so ]; then
-    echo "[*] Building rk_hw_base..."
-    git clone --depth=1 https://github.com/sujit-168/rk_hw_base /tmp/rk_hw_base
-    cd /tmp/rk_hw_base
-    make CFLAGS="-I./include -I/usr/include/rockchip -I/usr/include/rga -fPIC -Wall -O2" \
-         LDFLAGS="-shared -L/usr/lib/aarch64-linux-gnu"
-    cp lib/librk_hw_base.so /usr/lib/aarch64-linux-gnu/
-    mkdir -p /usr/include/rk_hw_base
-    cp include/*.h /usr/include/rk_hw_base/
-    ldconfig
-    cd /tmp
-fi
-
-# Build rockchip VAAPI driver
-if [ ! -f /usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so ]; then
-    echo "[*] Building rockchip_drv_video.so..."
-    git clone --depth=1 https://github.com/sujit-168/rk_vaapi_driver /tmp/rk_vaapi_driver
-    # Ensure rk_hw_base sibling is present (may be missing on re-run if already installed)
-    [ -d /tmp/rk_hw_base ] || git clone --depth=1 https://github.com/sujit-168/rk_hw_base /tmp/rk_hw_base
-    cd /tmp/rk_vaapi_driver
-    make
-    mkdir -p /usr/lib/aarch64-linux-gnu/dri
-    cp lib/rockchip_drv_video.so /usr/lib/aarch64-linux-gnu/dri/
-    ldconfig
-    cd /tmp
-    rm -rf /tmp/rk_vaapi_driver /tmp/rk_hw_base
-fi
-
-# Clean up build-only dependencies
-apt-get purge -y git build-essential libva-dev libdrm-dev pkg-config 2>/dev/null || true
+apt-get install -y --no-install-recommends git build-essential libva-dev librockchip-mpp-dev pkg-config
+rm -rf /tmp/rockchip-vaapi
+git clone --depth=1 https://github.com/woodyst/rockchip-vaapi /tmp/rockchip-vaapi
+cd /tmp/rockchip-vaapi
+for p in /tmp/vaapi-patches/*.patch; do
+    [ -f "$p" ] && git apply "$p" || true
+done
+make
+mkdir -p /usr/lib/aarch64-linux-gnu/dri
+cp rockchip_drv_video.so /usr/lib/aarch64-linux-gnu/dri/
+ldconfig
+cd /tmp
+rm -rf /tmp/rockchip-vaapi
+apt-get purge -y git build-essential libva-dev librockchip-mpp-dev pkg-config 2>/dev/null || true
 apt-get autoremove -y 2>/dev/null || true
-
-echo "[+] Rockchip VAAPI driver ready."
 BUILD_VAAPI_EOF
-chmod +x "${ROOTFS_MNT}/tmp/build_vaapi.sh"
-if chroot "${ROOTFS_MNT}" /tmp/build_vaapi.sh; then
-    echo "[*] VAAPI helper finished."
-else
-    echo "[!] Warning: VAAPI driver build failed; hardware video decode may be unavailable."
-fi
-rm -f "${ROOTFS_MNT}/tmp/build_vaapi.sh"
-
-echo "[*] Adding Firefox acceleration defaults..."
-mkdir -p "${ROOTFS_MNT}/usr/lib/firefox-esr/defaults/pref"
-FF_VAAPI_ENABLED="false"
-if [ -f "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so" ]; then
-    FF_VAAPI_ENABLED="true"
-    cat > "${ROOTFS_MNT}/usr/lib/firefox-esr/defaults/pref/rk3562-gfx.js" << 'FIREFOX_PREFS_HW'
-pref("media.hardware-video-decoding.enabled", true);
-pref("media.hardware-video-decoding.force-enabled", true);
-pref("media.ffmpeg.vaapi.enabled", true);
-pref("media.ffmpeg.dmabuf-textures.enabled", true);
-pref("media.rdd-ffmpeg.enabled", true);
-pref("media.ffvpx.enabled", false);
-pref("media.webm.enabled", false);
-pref("media.mediasource.webm.enabled", false);
-pref("media.av1.enabled", false);
-pref("media.mediasource.av1.enabled", false);
-pref("media.mediasource.vp9.enabled", false);
-FIREFOX_PREFS_HW
-else
-    echo "[!] Warning: rockchip_drv_video.so missing; using Firefox software-video fallback profile."
-    cat > "${ROOTFS_MNT}/usr/lib/firefox-esr/defaults/pref/rk3562-gfx.js" << 'FIREFOX_PREFS_SW'
-pref("media.hardware-video-decoding.enabled", false);
-pref("media.hardware-video-decoding.force-enabled", false);
-pref("media.ffmpeg.vaapi.enabled", false);
-pref("media.ffmpeg.dmabuf-textures.enabled", false);
-pref("media.rdd-ffmpeg.enabled", true);
-pref("media.ffvpx.enabled", false);
-pref("media.mediasource.enabled", false);
-pref("media.webm.enabled", false);
-pref("media.mediasource.webm.enabled", false);
-pref("media.av1.enabled", false);
-pref("media.mediasource.av1.enabled", false);
-pref("media.mediasource.vp9.enabled", false);
-FIREFOX_PREFS_SW
+    chmod +x "${ROOTFS_MNT}/tmp/build_vaapi.sh"
+    mkdir -p "${ROOTFS_MNT}/tmp/vaapi-patches"
+    cp "${ROOT_DIR}/overlay/vaapi-patches/"*.patch "${ROOTFS_MNT}/tmp/vaapi-patches/" 2>/dev/null || true
+    chroot "${ROOTFS_MNT}" /tmp/build_vaapi.sh || echo "[!] Warning: VAAPI driver build failed."
+    rm -rf "${ROOTFS_MNT}/tmp/build_vaapi.sh" "${ROOTFS_MNT}/tmp/vaapi-patches"
 fi
 
-# Keep Firefox environment deterministic across rebuilds.
+# Install MPP and DMA heap udev rules
+if [ -f "${ROOT_DIR}/overlay/70-rk-mpp.rules" ]; then
+    cp "${ROOT_DIR}/overlay/70-rk-mpp.rules" "${ROOTFS_MNT}/etc/udev/rules.d/70-rk-mpp.rules"
+    chmod 0644 "${ROOTFS_MNT}/etc/udev/rules.d/70-rk-mpp.rules"
+fi
+
+# Install uinput udev rule for unprivileged virtual input access
+if [ -f "${ROOT_DIR}/overlay/99-uinput.rules" ]; then
+    cp "${ROOT_DIR}/overlay/99-uinput.rules" "${ROOTFS_MNT}/etc/udev/rules.d/99-uinput.rules"
+    chmod 0644 "${ROOTFS_MNT}/etc/udev/rules.d/99-uinput.rules"
+fi
+
+# Keep VA-API environment deterministic across rebuilds.
 touch "${ROOTFS_MNT}/etc/environment"
-sed -i '/^MOZ_DISABLE_RDD_SANDBOX=/d;/^MOZ_X11_EGL=/d;/^MOZ_WEBRENDER=/d' \
+sed -i '/^MOZ_/d;/^LIBVA_DRIVER_NAME=/d;/^LIBVA_DRIVERS_PATH=/d' \
     "${ROOTFS_MNT}/etc/environment" || true
-echo "MOZ_DISABLE_RDD_SANDBOX=1" >> "${ROOTFS_MNT}/etc/environment"
+echo "LIBVA_DRIVER_NAME=rockchip" >> "${ROOTFS_MNT}/etc/environment"
+echo "LIBVA_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri" >> "${ROOTFS_MNT}/etc/environment"
 
-# Auto-install h264ify on first Firefox run to keep YouTube on H.264 streams.
-mkdir -p "${ROOTFS_MNT}/usr/lib/firefox-esr/distribution"
-cat > "${ROOTFS_MNT}/usr/lib/firefox-esr/distribution/policies.json" << 'FIREFOX_POLICIES'
-{
-  "policies": {
-    "Extensions": {
-      "Install": [
-        "https://addons.mozilla.org/firefox/downloads/latest/h264ify/latest.xpi"
-      ]
-    }
-  }
-}
-FIREFOX_POLICIES
-
-# ── Custom Plymouth boot splash ────────────────────────────────────────────
-# Replaces the plain black screen with a navy gradient, "RK3562 / Debian
-# GNU/Linux" text, a faded divider line, and 5 pulsing dots.
-# PNG assets are generated with pure Python (no PIL dependency).
+# Install custom Plymouth boot splash theme.
 echo "[*] Installing custom Plymouth boot splash..."
 THEME_DIR="${ROOTFS_MNT}/usr/share/plymouth/themes/rkdebian"
 mkdir -p "${THEME_DIR}"
+rm -f "${THEME_DIR}/dot.png"
 
-# dot.png — 14×14 soft-edged white circle for the loading dots
-python3 - "${THEME_DIR}/dot.png" << 'PYGEN'
-import sys, zlib, struct
-
-def write_png(path, w, h, rows_rgba):
-    def chunk(tag, data):
-        crc = zlib.crc32(tag + data) & 0xffffffff
-        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', crc)
-    raw = b''.join(b'\x00' + bytes(r) for r in rows_rgba)
-    with open(path, 'wb') as f:
-        f.write(b'\x89PNG\r\n\x1a\n')
-        f.write(chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)))
-        f.write(chunk(b'IDAT', zlib.compress(raw, 9)))
-        f.write(chunk(b'IEND', b''))
-
-W = H = 14
-cx = cy = W / 2.0
-r  = W / 2.0 - 1.0
-rows = []
-for y in range(H):
-    row = []
-    for x in range(W):
-        d     = ((x + 0.5 - cx)**2 + (y + 0.5 - cy)**2)**0.5
-        alpha = min(255, max(0, int((r - d) * 90)))
-        row  += [255, 255, 255, alpha]
-    rows.append(row)
-write_png(sys.argv[1], W, H, rows)
-PYGEN
-
-# line.png — 280×2 white bar that fades at both edges (decorative divider)
-python3 - "${THEME_DIR}/line.png" << 'PYGEN'
-import sys, zlib, struct
-
-def write_png(path, w, h, rows_rgba):
-    def chunk(tag, data):
-        crc = zlib.crc32(tag + data) & 0xffffffff
-        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', crc)
-    raw = b''.join(b'\x00' + bytes(r) for r in rows_rgba)
-    with open(path, 'wb') as f:
-        f.write(b'\x89PNG\r\n\x1a\n')
-        f.write(chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)))
-        f.write(chunk(b'IDAT', zlib.compress(raw, 9)))
-        f.write(chunk(b'IEND', b''))
-
-W, H = 280, 2
-rows = []
-for y in range(H):
-    row = []
-    for x in range(W):
-        fade  = min(x, W - x) / 28.0
-        alpha = min(255, int(55 * min(1.0, fade)))
-        row  += [255, 255, 255, alpha]
-    rows.append(row)
-write_png(sys.argv[1], W, H, rows)
-PYGEN
-
-# splash.png — custom boot logo from repository root
+# splash.png - custom boot logo from repository root.
 if [ ! -f "${ROOT_DIR}/splash.png" ]; then
     echo "[-] Error: missing ${ROOT_DIR}/splash.png (required for Plymouth logo)."
     exit 1
 fi
 install -m 0644 "${ROOT_DIR}/splash.png" "${THEME_DIR}/splash.png"
+# Generate pre-rotated portrait variant for portrait display modes (avoids runtime script rotation crash)
+python3 -c "from PIL import Image; im = Image.open('${ROOT_DIR}/splash.png'); im.transpose(Image.ROTATE_270).save('${THEME_DIR}/splash-portrait.png')" 2>/dev/null || \
+    cp -f "${THEME_DIR}/splash.png" "${THEME_DIR}/splash-portrait.png"
 mkdir -p "${ROOTFS_MNT}/usr/share/backgrounds/rkdebian"
 install -m 0644 "${ROOT_DIR}/splash.png" \
     "${ROOTFS_MNT}/usr/share/backgrounds/rkdebian/splash.png"
 
-# Static framebuffer logo shown while booting. This bypasses Plymouth, which
-# currently crashes on this Trixie + RK3562 stack.
-mkdir -p "${ROOTFS_MNT}/usr/local/sbin" \
-         "${ROOTFS_MNT}/etc/systemd/system" \
-         "${ROOTFS_MNT}/etc/systemd/system/graphical.target.wants"
-cat > "${ROOTFS_MNT}/usr/local/sbin/boot-fb-logo.sh" << 'BOOT_FB_LOGO'
-#!/bin/sh
-set -eu
-
-IMG="/usr/share/plymouth/themes/rkdebian/splash.png"
-FB="/dev/fb0"
-
-[ -r "$IMG" ] || exit 0
-command -v ffmpeg >/dev/null 2>&1 || exit 0
-
-# Wait briefly for framebuffer device.
-i=0
-while [ $i -lt 40 ]; do
-    [ -w "$FB" ] && break
-    i=$((i + 1))
-    sleep 0.1
-done
-[ -w "$FB" ] || exit 0
-
-W=800
-H=1280
-if [ -r /sys/class/graphics/fb0/virtual_size ]; then
-    VS="$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null || true)"
-    case "$VS" in
-        *,*) W="${VS%%,*}"; H="${VS##*,}" ;;
-    esac
-fi
-
-# The panel is rotated by kernel cmdline; rotate logo into expected orientation.
-ROTATE_FILTER="transpose=1"
-
-# Draw a centered, padded static splash. Repeat to survive early mode changes.
-N=0
-while [ $N -lt 5 ]; do
-    ffmpeg -nostdin -hide_banner -loglevel error -y \
-        -i "$IMG" -frames:v 1 \
-        -vf "${ROTATE_FILTER},scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2" \
-        -pix_fmt bgra -f fbdev "$FB" >/dev/null 2>&1 || true
-    N=$((N + 1))
-    sleep 0.2
-done
-
-exit 0
-BOOT_FB_LOGO
-chmod +x "${ROOTFS_MNT}/usr/local/sbin/boot-fb-logo.sh"
-
-cat > "${ROOTFS_MNT}/etc/systemd/system/boot-fb-logo.service" << 'BOOT_FB_LOGO_UNIT'
-[Unit]
-Description=Draw static boot logo on framebuffer
-After=systemd-udev-settle.service
-Before=display-manager.service lightdm.service
-ConditionPathExists=/dev/fb0
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/boot-fb-logo.sh
-TimeoutStartSec=15
-
-[Install]
-WantedBy=graphical.target
-BOOT_FB_LOGO_UNIT
-ln -sfn /etc/systemd/system/boot-fb-logo.service \
-    "${ROOTFS_MNT}/etc/systemd/system/graphical.target.wants/boot-fb-logo.service"
-
-# Theme descriptor
+# Theme descriptor.
 cat > "${THEME_DIR}/rkdebian.plymouth" << 'PLYMOUTH_DESC'
 [Plymouth Theme]
 Name=rkdebian
@@ -1122,7 +957,7 @@ ImageDir=/usr/share/plymouth/themes/rkdebian
 ScriptFile=/usr/share/plymouth/themes/rkdebian/rkdebian.script
 PLYMOUTH_DESC
 
-# Animation script — runs inside Plymouth on the framebuffer
+# Static script: black background + centered logo.
 cat > "${THEME_DIR}/rkdebian.script" << 'PLYMOUTH_SCRIPT'
 W = Window.GetWidth();
 H = Window.GetHeight();
@@ -1131,10 +966,14 @@ H = Window.GetHeight();
 Window.SetBackgroundTopColor(0.00, 0.00, 0.00);
 Window.SetBackgroundBottomColor(0.00, 0.00, 0.00);
 
-# ── Logo ───────────────────────────────────────────────────────────────────
-logo_base = Image("splash.png");
+# Centered logo (use pre-rotated portrait asset if panel is in native portrait)
+if (W < H) {
+    logo_base = Image("splash-portrait.png");
+} else {
+    logo_base = Image("splash.png");
+}
 logo_scale_w = (W * 0.78) / logo_base.GetWidth();
-logo_scale_h = (H * 0.45) / logo_base.GetHeight();
+logo_scale_h = (H * 0.78) / logo_base.GetHeight();
 logo_scale = Math.Min(logo_scale_w, logo_scale_h);
 if (logo_scale > 1.0) logo_scale = 1.0;
 logo = logo_base.Scale(logo_base.GetWidth() * logo_scale,
@@ -1142,74 +981,105 @@ logo = logo_base.Scale(logo_base.GetWidth() * logo_scale,
 logo_spr = Sprite();
 logo_spr.SetImage(logo);
 logo_spr.SetX(Math.Int(W / 2 - logo.GetWidth() / 2));
-logo_spr.SetY(Math.Int(H * 0.18));
-
-# ── Pulsing dot loader (5 dots, wave ripple) ───────────────────────────────
-N      = 5;
-STEP   = 22;
-DOT_Y  = Math.Int(H * 0.73);
-ORIGIN = Math.Int(W / 2 - (N - 1) * STEP / 2);
-
-dot_img = Image("dot.png");
-for (i = 0; i < N; i++) {
-    dot[i] = Sprite();
-    dot[i].SetImage(dot_img);
-    dot[i].SetX(ORIGIN + i * STEP - Math.Int(dot_img.GetWidth() / 2));
-    dot[i].SetY(DOT_Y);
-    dot[i].SetOpacity(0.15);
-}
-
-tick = 0;
-fun animate() {
-    tick++;
-    peak = Math.Int(tick / 7) % N;
-    for (i = 0; i < N; i++) {
-        diff = i - peak;
-        if (diff < 0) diff = -diff;
-        opacity = 1.0 - diff * 0.25;
-        if (opacity < 0.10) opacity = 0.10;
-        dot[i].SetOpacity(opacity);
-    }
-}
-Plymouth.SetRefreshFunction(animate);
+logo_spr.SetY(Math.Int(H / 2 - logo.GetHeight() / 2));
 PLYMOUTH_SCRIPT
 
-# Activate the theme (overrides the 'spinner' set earlier in the chroot)
+# Activate the custom theme.
 chroot "${ROOTFS_MNT}" plymouth-set-default-theme rkdebian 2>/dev/null || \
     echo "[!] Warning: could not set Plymouth theme; 'spinner' will be used"
 
 # Add Chromium hardware acceleration flags.
 echo "[*] Adding Chromium acceleration flags..."
 mkdir -p "${ROOTFS_MNT}/etc/chromium.d"
-if [ "${FF_VAAPI_ENABLED}" = "true" ]; then
+if [ -f "${ROOTFS_MNT}/usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so" ]; then
+    mkdir -p "${ROOTFS_MNT}/usr/share/chromium/extensions/block-av1"
+    cat > "${ROOTFS_MNT}/usr/share/chromium/extensions/block-av1/manifest.json" << 'BLOCK_AV1_MANIFEST'
+{
+  "name": "Block AV1 for Hardware VP9",
+  "version": "1.0",
+  "manifest_version": 3,
+  "description": "Blocks software AV1 decode so hardware VP9 is used",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["block_av1.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
+BLOCK_AV1_MANIFEST
+    cat > "${ROOTFS_MNT}/usr/share/chromium/extensions/block-av1/block_av1.js" << 'BLOCK_AV1_JS'
+(function() {
+  if (window.MediaSource && window.MediaSource.isTypeSupported) {
+    var origIsTypeSupported = window.MediaSource.isTypeSupported.bind(window.MediaSource);
+    window.MediaSource.isTypeSupported = function(type) {
+      if (typeof type === 'string' && (type.toLowerCase().includes('av01') || type.toLowerCase().includes('av1'))) {
+        return false;
+      }
+      return origIsTypeSupported(type);
+    };
+  }
+  if (window.HTMLMediaElement && window.HTMLMediaElement.prototype.canPlayType) {
+    var origCanPlayType = window.HTMLMediaElement.prototype.canPlayType;
+    window.HTMLMediaElement.prototype.canPlayType = function(type) {
+      if (typeof type === 'string' && (type.toLowerCase().includes('av01') || type.toLowerCase().includes('av1'))) {
+        return '';
+      }
+      return origCanPlayType.apply(this, arguments);
+    };
+  }
+  if (navigator.mediaCapabilities && navigator.mediaCapabilities.decodingInfo) {
+    var origDecodingInfo = navigator.mediaCapabilities.decodingInfo.bind(navigator.mediaCapabilities);
+    navigator.mediaCapabilities.decodingInfo = function(config) {
+      if (config && config.video && config.video.contentType) {
+        var ct = config.video.contentType.toLowerCase();
+        if (ct.includes('av01') || ct.includes('av1')) {
+          return Promise.resolve({
+            supported: false,
+            smooth: false,
+            powerEfficient: false
+          });
+        }
+      }
+      return origDecodingInfo(config);
+    };
+  }
+
+  // Tablet touch usability: Tap on whitespace/background blurs active input to dismiss OSK
+  function handleTapOutside(e) {
+    var active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+      if (!e.target.closest('input, textarea, [contenteditable="true"], select, button, a, [role="button"]')) {
+        active.blur();
+      }
+    }
+  }
+  document.addEventListener('pointerdown', handleTapOutside, true);
+  document.addEventListener('touchstart', handleTapOutside, true);
+})();
+BLOCK_AV1_JS
+    chmod -R 755 "${ROOTFS_MNT}/usr/share/chromium/extensions/block-av1"
+
     cat > "${ROOTFS_MNT}/etc/chromium.d/rk3562-hw-accel" << 'CHROMIUM_HW_FLAGS'
 # RK3562 hardware acceleration — sourced by /usr/bin/chromium wrapper
-# Let Chromium select its default GL backend for this build.
-# On Debian Chromium arm64, forcing --use-gl=egl can trigger GPU init fallback.
-# rockchip VAAPI decode is available but has been unstable on YouTube with
-# newer Chromium builds; default to software decode for reliability.
 export LIBVA_DRIVER_NAME=rockchip
 export LIBVA_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ozone-platform=wayland"
-# Chromium 146 on RK3562 + Wayland can auto-pick Vulkan and fail window
-# startup; force non-Vulkan rendering for reliable launch.
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --render-node-override=/dev/dri/renderD128"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --hardware-video-device-path=/dev/dri/renderD128"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-vulkan"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-compositing"
-# Avoid GNOME keyring first-launch password prompt on autologin images.
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --password-store=basic"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-accelerated-video-decode"
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,VaapiIgnoreDriverChecks,UseChromeOSDirectVideoDecoder"
-# RK3562 fallback safety profile: software compositing is slower but avoids
-# GPU process crashes seen on some YouTube/Wayland workloads.
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-gpu"
-# Optional (faster but less stable on some images): enable VAAPI decode
-# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-accelerated-video-decode"
-# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,VaapiIgnoreDriverChecks"
-# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-features=UseChromeOSDirectVideoDecoder"
-# ── FALLBACK: if Chromium regresses, force ANGLE explicitly: ──
-# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=angle"
-# CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=opengles"
+
+# Enable VA-API Hardware Video Decode & Encode
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --ignore-gpu-blocklist"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-accelerated-video-decode"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-accelerated-video-encode"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL,VaapiIgnoreDriverChecks,VaapiVideoEncoder,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL,AcceleratedVideoEncoder,UseOzonePlatform,WebRtcPipeWireCamera"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-features=UseChromeOSDirectVideoDecoder,Vulkan"
+CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --load-extension=/usr/share/chromium/extensions/block-av1"
 CHROMIUM_HW_FLAGS
 else
     # No rockchip VAAPI driver — GPU compositing only, software video decode.
@@ -1222,9 +1092,6 @@ CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-rasterization"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --enable-gpu-compositing"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --password-store=basic"
 CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-accelerated-video-decode"
-# RK3562 fallback safety profile: software compositing is slower but avoids
-# GPU process crashes seen on some YouTube/Wayland workloads.
-CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --disable-gpu"
 # ── FALLBACK: if Chromium regresses, force ANGLE explicitly: ──
 # CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-gl=angle"
 # CHROMIUM_FLAGS="${CHROMIUM_FLAGS} --use-angle=opengles"
@@ -1276,9 +1143,118 @@ else
     echo "[!] Warning: ${PHOSH_BIN} not found; drag-mode patch skipped."
 fi
 
+# Remove standard PIN keypad and force virtual on-screen keyboard on lockscreen (closes #10).
+# The default user password is "chaos" (alphanumeric); presenting a numeric PIN keypad confuses
+# users who do not know to tap the tiny keyboard toggle icon.
+echo "[*] Patching Phosh lockscreen: remove standard PIN keypad and force virtual keyboard..."
+if [ -f "${PHOSH_BIN}" ]; then
+    python3 - "${PHOSH_BIN}" << 'PY_PHOSH_LOCKSCREEN_PATCH'
+import sys
+
+
+phosh_path = sys.argv[1] if len(sys.argv) > 1 else "/usr/libexec/phosh"
+try:
+    with open(phosh_path, "r+b") as f:
+        data = f.read()
+
+        # 1. Force OSK when entering unlock page (carousel_page_changed_cb)
+        pat_a = bytes.fromhex("f71b00f9 d71286b9 7702178b".replace(" ", ""))
+        idx_a = data.find(pat_a)
+        if idx_a != -1:
+            curr = data[idx_a+12:idx_a+16]
+            if curr == bytes.fromhex("13000014"):
+                print("    - force OSK on unlock: already patched")
+            elif curr == bytes.fromhex("75020035"):
+                f.seek(idx_a + 12)
+                f.write(bytes.fromhex("13000014"))
+                print(f"    - force OSK on unlock: patched at 0x{idx_a+12:x}")
+            else:
+                print(f"[!] Warning: unexpected opcode at idx_a+12: {curr.hex()}")
+        else:
+            print("[!] Warning: carousel_page_changed_cb pattern not found in phosh binary")
+
+        # 2. Preserve OSK IM context when OSK visibility toggles (on_osk_visibility_changed)
+        pat_b = bytes.fromhex("a8250094 a0000034 f35341a9 fd7bc2a8 bf2303d5 c0035fd6".replace(" ", ""))
+        idx_b = data.find(pat_b)
+        if idx_b != -1:
+            f.seek(idx_b + 4)
+            f.write(bytes.fromhex("1f2003d5"))
+            print(f"    - preserve OSK IM context: patched at 0x{idx_b+4:x}")
+        else:
+            pat_b_done = bytes.fromhex("a8250094 1f2003d5 f35341a9 fd7bc2a8 bf2303d5 c0035fd6".replace(" ", ""))
+            if data.find(pat_b_done) != -1:
+                print("    - preserve OSK IM context: already patched")
+            else:
+                print("[!] Warning: on_osk_visibility_changed pattern not found in phosh binary")
+
+        # 3. Suppress keypad revealer binding in phosh_lockscreen_constructed
+        pat_c = bytes.fromhex("823e40f9 e10316aa c4008052 63030090 63600d91 f1b4fd97".replace(" ", ""))
+        idx_c = data.find(pat_c)
+        if idx_c != -1:
+            f.seek(idx_c + 20)
+            f.write(bytes.fromhex("1f2003d5"))
+            print(f"    - suppress keypad revealer binding: patched at 0x{idx_c+20:x}")
+        else:
+            pat_c_done = bytes.fromhex("823e40f9 e10316aa c4008052 63030090 63600d91 1f2003d5".replace(" ", ""))
+            if data.find(pat_c_done) != -1:
+                print("    - suppress keypad revealer binding: already patched")
+            else:
+                print("[!] Warning: phosh_lockscreen_constructed keypad binding not found in phosh binary")
+
+        # 4. Hide keypad revealer & keypad widget in UI template
+        pat_d1 = b"<object class=\"GtkRevealer\" id=\"keypad_revealer\">\n                <property name=\"visible\">1</property>"
+        repl_d1 = b"<object class=\"GtkRevealer\" id=\"keypad_revealer\">\n                <property name=\"visible\">0</property>"
+        idx_d1 = data.find(pat_d1)
+        if idx_d1 != -1:
+            f.seek(idx_d1)
+            f.write(repl_d1)
+            print(f"    - hide keypad_revealer widget: patched at 0x{idx_d1:x}")
+        else:
+            if data.find(repl_d1) != -1:
+                print("    - hide keypad_revealer widget: already patched")
+            else:
+                print("[!] Warning: keypad_revealer UI xml not found")
+
+        pat_d2 = b"<object class=\"PhoshKeypad\" id=\"keypad\">\n                    <property name=\"visible\">1</property>"
+        repl_d2 = b"<object class=\"PhoshKeypad\" id=\"keypad\">\n                    <property name=\"visible\">0</property>"
+        idx_d2 = data.find(pat_d2)
+        if idx_d2 != -1:
+            f.seek(idx_d2)
+            f.write(repl_d2)
+            print(f"    - hide keypad widget: patched at 0x{idx_d2:x}")
+        else:
+            if data.find(repl_d2) != -1:
+                print("    - hide keypad widget: already patched")
+            else:
+                print("[!] Warning: keypad widget UI xml not found")
+
+        # 5. Replace 'Enter Passcode' with 'Enter Password' (14 chars)
+        pos = 0
+        cnt_passcode = 0
+        while True:
+            idx_passcode = data.find(b"Enter Passcode", pos)
+            if idx_passcode == -1:
+                break
+            f.seek(idx_passcode)
+            f.write(b"Enter Password")
+            cnt_passcode += 1
+            pos = idx_passcode + 14
+        if cnt_passcode > 0:
+            print(f"    - replace Enter Passcode with Enter Password: {cnt_passcode} updated")
+        else:
+            if b"Enter Password" in data:
+                print("    - replace Enter Passcode with Enter Password: already patched")
+except Exception as e:
+    print(f"[!] Warning: failed to patch phosh lockscreen: {e}")
+PY_PHOSH_LOCKSCREEN_PATCH
+else
+    echo "[!] Warning: ${PHOSH_BIN} not found; lockscreen patch skipped."
+fi
+
 # 8. Setting hostname and fstab
 echo "[*] Setting hostname and fstab..."
 echo "rk3562-debian" > "${ROOTFS_MNT}/etc/hostname"
+echo "CHASSIS=tablet" > "${ROOTFS_MNT}/etc/machine-info"
 
 # Record the requested build profile inside the rootfs for post-flash checks.
 cat > "${ROOTFS_MNT}/etc/rkdebian-build-profile" << PROFILE_EOF
@@ -1293,6 +1269,7 @@ PROFILE_EOF
 cat > "${ROOTFS_MNT}/etc/fstab" << 'FSTAB'
 # <file system>  <mount point>  <type>  <options>        <dump>  <pass>
 PARTUUID=c0ffee11-2233-4455-6677-8899aabbccdd  /  ext4  defaults,noatime  0  1
+binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc defaults 0 0
 FSTAB
 
 # 9. Configure display manager autologin
@@ -1338,17 +1315,24 @@ session-wrapper=/etc/X11/Xsession
 
 [VNCServer]
 LIGHTDM_CONF
-mkdir -p "${ROOTFS_MNT}/etc/X11" "${ROOTFS_MNT}/etc/systemd/system"
+mkdir -p "${ROOTFS_MNT}/etc/X11" "${ROOTFS_MNT}/etc/systemd/system" \
+         "${ROOTFS_MNT}/etc/systemd/system/lightdm.service.d"
 printf '%s\n' '/usr/sbin/lightdm' > "${ROOTFS_MNT}/etc/X11/default-display-manager"
 ln -sfn /lib/systemd/system/lightdm.service "${ROOTFS_MNT}/etc/systemd/system/display-manager.service"
+cat > "${ROOTFS_MNT}/etc/systemd/system/lightdm.service.d/plymouth-retain.conf" << 'LIGHTDM_PLYMOUTH'
+[Service]
+ExecStartPre=-/usr/bin/plymouth quit --retain-splash
+LIGHTDM_PLYMOUTH
 # Avoid a tty1 text login flicker between boot logo and GUI.
 ln -sfn /dev/null "${ROOTFS_MNT}/etc/systemd/system/getty@tty1.service"
+rm -f "${ROOTFS_MNT}/etc/systemd/system/getty.target.wants/getty@tty1.service"
 
-# Plasma Discover can fail to launch on this Wayland + Mali stack when Qt's
-# default GL path cannot initialize EGL. Provide a software-rendered wrapper
-# and override the desktop entry to keep app store access functional.
-mkdir -p "${ROOTFS_MNT}/usr/local/bin" "${ROOTFS_MNT}/usr/local/share/applications"
-cat > "${ROOTFS_MNT}/usr/local/bin/plasma-discover-safe" << 'PLASMA_DISCOVER_SAFE'
+if [ "${RKDEBIAN_GPU_STACK}" = "mali" ]; then
+    # Plasma Discover can fail to launch on this Wayland + Mali stack when Qt's
+    # default GL path cannot initialize EGL. Provide a software-rendered wrapper
+    # and override the desktop entry to keep app store access functional.
+    mkdir -p "${ROOTFS_MNT}/usr/local/bin" "${ROOTFS_MNT}/usr/local/share/applications"
+    cat > "${ROOTFS_MNT}/usr/local/bin/plasma-discover-safe" << 'PLASMA_DISCOVER_SAFE'
 #!/bin/sh
 set -eu
 export QSG_RHI_BACKEND="${QSG_RHI_BACKEND:-software}"
@@ -1356,14 +1340,15 @@ export QT_QUICK_BACKEND="${QT_QUICK_BACKEND:-software}"
 export QT_OPENGL="${QT_OPENGL:-software}"
 exec /usr/bin/plasma-discover "$@"
 PLASMA_DISCOVER_SAFE
-chmod +x "${ROOTFS_MNT}/usr/local/bin/plasma-discover-safe"
-if [ -f "${ROOTFS_MNT}/usr/share/applications/org.kde.discover.desktop" ]; then
-    cp -f "${ROOTFS_MNT}/usr/share/applications/org.kde.discover.desktop" \
-        "${ROOTFS_MNT}/usr/local/share/applications/org.kde.discover.desktop"
-    sed -i 's|^Exec=plasma-discover %F$|Exec=/usr/local/bin/plasma-discover-safe %F|' \
-        "${ROOTFS_MNT}/usr/local/share/applications/org.kde.discover.desktop"
-    sed -i 's|^Exec=plasma-discover --mode update$|Exec=/usr/local/bin/plasma-discover-safe --mode update|' \
-        "${ROOTFS_MNT}/usr/local/share/applications/org.kde.discover.desktop"
+    chmod +x "${ROOTFS_MNT}/usr/local/bin/plasma-discover-safe"
+    if [ -f "${ROOTFS_MNT}/usr/share/applications/org.kde.discover.desktop" ]; then
+        cp -f "${ROOTFS_MNT}/usr/share/applications/org.kde.discover.desktop" \
+            "${ROOTFS_MNT}/usr/local/share/applications/org.kde.discover.desktop"
+        sed -i 's|^Exec=plasma-discover %F$|Exec=/usr/local/bin/plasma-discover-safe %F|' \
+            "${ROOTFS_MNT}/usr/local/share/applications/org.kde.discover.desktop"
+        sed -i 's|^Exec=plasma-discover --mode update$|Exec=/usr/local/bin/plasma-discover-safe --mode update|' \
+            "${ROOTFS_MNT}/usr/local/share/applications/org.kde.discover.desktop"
+    fi
 fi
 
 # Stale user-unit symlinks from old sway-focused rootfs trees can trigger
@@ -2133,6 +2118,177 @@ fi
 # Remove stale keyboard launcher that points to Maliit binaries.
 rm -f "${ROOTFS_MNT}/home/chaos/Desktop/on-screen-keyboard.desktop"
 
+# Install custom Squeekboard layouts with down-arrow hide button.
+for kbd_dir in "${ROOTFS_MNT}/etc/skel/.local/share/squeekboard/keyboards" \
+               "${ROOTFS_MNT}/home/chaos/.local/share/squeekboard/keyboards"; do
+    mkdir -p "${kbd_dir}"
+    cat > "${kbd_dir}/us_wide.yaml" << 'SQUEEK_US_WIDE'
+# Language: English (US)
+---
+outlines:
+    default:       { width: 53.76,  height: 42 }
+    change-view:   { width: 80.64,  height: 42 }
+    change-view-2: { width: 94.08,  height: 42 }
+    large:         { width: 53.76,  height: 42 }
+    spaceline:     { width: 241.92, height: 42 }
+    special:       { width: 53.76,  height: 42 }
+    special-2:     { width: 80.64,  height: 42 }
+    special-3:     { width: 94.08,  height: 42 }
+
+views:
+    base:
+        - "q w e r t y u i o p"
+        - "a s d f g h j k l"
+        - "show_upper z x c v b n m BackSpace"
+        - "show_numbers hide space . Return"
+    upper:
+        - "Q W E R T Y U I O P"
+        - "A S D F G H J K L"
+        - "show_upper Z X C V B N M BackSpace"
+        - "show_numbers hide space . Return"
+    numbers:
+        - "1 2 3 4 5 6 7 8 9 0"
+        - "@ # $ % & - _ + ( )"
+        - "show_symbols , \" ' : ; ! ? BackSpace"
+        - "show_letters hide space . Return"
+    symbols:
+        - "~ ` | · √ π τ ÷ × ¶"
+        - "© ® £ € ¥ ^ ° * { }"
+        - "show_numbers_from_symbols \\ / < > = [ ] BackSpace"
+        - "show_letters hide space . Return"
+
+buttons:
+    show_upper:
+        action:
+            locking:
+                lock_view: "upper"
+                unlock_view: "base"
+        outline: "change-view"
+        icon: "key-shift"
+    BackSpace:
+        outline: "special-2"
+        icon: "edit-clear-symbolic"
+        action: "erase"
+    hide:
+        outline: "special"
+        icon: "go-down-symbolic"
+        label: "▼"
+        keysym: "Escape"
+    show_numbers:
+        action:
+            set_view: "numbers"
+        outline: "change-view-2"
+        label: "123"
+    show_numbers_from_symbols:
+        action:
+            set_view: "numbers"
+        outline: "change-view"
+        label: "123"
+    show_letters:
+        action:
+            set_view: "base"
+        outline: "change-view-2"
+        label: "ABC"
+    show_symbols:
+        action:
+            set_view: "symbols"
+        outline: "change-view"
+        label: "*/="
+    .:
+        outline: "large"
+    space:
+        outline: "spaceline"
+        text: " "
+    Return:
+        outline: "special-3"
+        icon: "key-enter"
+        keysym: "Return"
+SQUEEK_US_WIDE
+
+    cat > "${kbd_dir}/us.yaml" << 'SQUEEK_US'
+# Language: English (US)
+---
+outlines:
+    default:       { width: 35.657, height: 52 }
+    change-view:   { width: 53.485, height: 52 }
+    change-view-2: { width: 62.399, height: 52 }
+    large:         { width: 44.571, height: 52 }
+    spaceline:     { width: 142.63, height: 52 }
+    special:       { width: 44.571, height: 52 }
+    special-2:     { width: 53.485, height: 52 }
+    special-3:     { width: 62.399, height: 52 }
+
+views:
+    base:
+        - "q w e r t y u i o p"
+        - "a s d f g h j k l"
+        - "show_upper z x c v b n m BackSpace"
+        - "show_numbers hide space . Return"
+    upper:
+        - "Q W E R T Y U I O P"
+        - "A S D F G H J K L"
+        - "show_upper Z X C V B N M BackSpace"
+        - "show_numbers hide space . Return"
+    numbers:
+        - "1 2 3 4 5 6 7 8 9 0"
+        - "@ # $ % & - _ + ( )"
+        - "show_symbols , \" ' : ; ! ? BackSpace"
+        - "show_letters hide space . Return"
+    symbols:
+        - "~ ` | · √ π τ ÷ × ¶"
+        - "© ® £ € ¥ ^ ° * { }"
+        - "show_numbers_from_symbols \\ / < > = [ ] BackSpace"
+        - "show_letters hide space . Return"
+
+buttons:
+    show_upper:
+        action:
+            locking:
+                lock_view: "upper"
+                unlock_view: "base"
+        outline: "change-view"
+        icon: "key-shift"
+    BackSpace:
+        outline: "special-2"
+        icon: "edit-clear-symbolic"
+        action: "erase"
+    hide:
+        outline: "special"
+        icon: "go-down-symbolic"
+        label: "▼"
+        keysym: "Escape"
+    show_numbers:
+        action:
+            set_view: "numbers"
+        outline: "change-view-2"
+        label: "123"
+    show_numbers_from_symbols:
+        action:
+            set_view: "numbers"
+        outline: "change-view"
+        label: "123"
+    show_letters:
+        action:
+            set_view: "base"
+        outline: "change-view-2"
+        label: "ABC"
+    show_symbols:
+        action:
+            set_view: "symbols"
+        outline: "change-view"
+        label: "*/="
+    .:
+        outline: "large"
+    space:
+        outline: "spaceline"
+        text: " "
+    Return:
+        outline: "special-3"
+        icon: "key-enter"
+        keysym: "Return"
+SQUEEK_US
+done
+
 # Ensure user-level config/cache dirs are writable by the session user.
 # Some build-time mkdir operations run as root and can otherwise leave these
 # directories owned by root, which breaks desktop startup.
@@ -2295,6 +2451,22 @@ if [ -f "${ROOT_DIR}/overlay/rkcam-rear-preview.sh" ] && \
         /home/chaos/Desktop/Rear-Camera-Preview.desktop || true
 fi
 
+# Install Tablet Dock Controller (turns tablet into trackpad & keyboard for external monitor)
+if [ -f "${ROOT_DIR}/overlay/tablet-dock-pad.py" ] && \
+   [ -f "${ROOT_DIR}/overlay/dock-mode.sh" ]; then
+    echo "[*] Installing Tablet Dock Controller..."
+    cp "${ROOT_DIR}/overlay/tablet-dock-pad.py" "${ROOTFS_MNT}/usr/local/bin/tablet-dock-pad.py"
+    cp "${ROOT_DIR}/overlay/dock-mode.sh" "${ROOTFS_MNT}/usr/local/bin/dock-mode.sh"
+    chmod 0755 "${ROOTFS_MNT}/usr/local/bin/tablet-dock-pad.py" "${ROOTFS_MNT}/usr/local/bin/dock-mode.sh"
+    if [ -f "${ROOT_DIR}/overlay/tablet-dock.desktop" ]; then
+        cp "${ROOT_DIR}/overlay/tablet-dock.desktop" "${ROOTFS_MNT}/usr/share/applications/tablet-dock.desktop"
+        chmod 0644 "${ROOTFS_MNT}/usr/share/applications/tablet-dock.desktop"
+        mkdir -p "${ROOTFS_MNT}/home/chaos/.local/share/applications"
+        cp "${ROOT_DIR}/overlay/tablet-dock.desktop" "${ROOTFS_MNT}/home/chaos/.local/share/applications/tablet-dock.desktop"
+        chroot "${ROOTFS_MNT}" chown -R chaos:chaos /home/chaos/.local/share/applications/tablet-dock.desktop || true
+    fi
+fi
+
 # Remove deprecated lantern app leftovers from reused base rootfs images.
 rm -f \
     "${ROOTFS_MNT}/home/chaos/.local/bin/rk-lantern.sh" \
@@ -2389,28 +2561,9 @@ for arg in "$@"; do
   args+=("$arg")
 done
 
-exec chromium \
-  --ozone-platform-hint=auto \
-  --enable-features=UseOzonePlatform,WebRtcPipeWireCamera \
-  "${args[@]}"
+exec chromium "${args[@]}"
 CHROMIUM_PWCAM
 chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/chromium-pwcam"
-
-cat > "${ROOTFS_MNT}/home/chaos/.local/bin/firefox-pwcam" << 'FIREFOX_PWCAM'
-#!/bin/sh
-set -eu
-exec env -u MOZ_X11_EGL \
-  MOZ_DISABLE_RDD_SANDBOX=1 \
-  MOZ_ENABLE_WAYLAND=1 \
-  MOZ_WAYLAND_USE_VAAPI=1 \
-  MOZ_DRM_DEVICE=/dev/dri/renderD128 \
-  LIBVA_DRIVER_NAME=rockchip \
-  /usr/lib/firefox-esr/firefox-esr \
-  --setpref media.webrtc.capture.allow-pipewire=true \
-  --setpref media.webrtc.camera.allow-pipewire=true \
-  "$@"
-FIREFOX_PWCAM
-chmod +x "${ROOTFS_MNT}/home/chaos/.local/bin/firefox-pwcam"
 
 if [ -f "${ROOTFS_MNT}/usr/share/applications/chromium.desktop" ]; then
     cp -f "${ROOTFS_MNT}/usr/share/applications/chromium.desktop" \
@@ -2419,16 +2572,22 @@ if [ -f "${ROOTFS_MNT}/usr/share/applications/chromium.desktop" ]; then
           "${ROOTFS_MNT}/home/chaos/.local/share/applications/chromium.desktop"
 fi
 
-if [ -f "${ROOTFS_MNT}/usr/share/applications/firefox-esr.desktop" ]; then
-    cp -f "${ROOTFS_MNT}/usr/share/applications/firefox-esr.desktop" \
-          "${ROOTFS_MNT}/home/chaos/.local/share/applications/firefox-esr.desktop"
-    sed -i 's|^Exec=.*|Exec=/home/chaos/.local/bin/firefox-pwcam %u|' \
-          "${ROOTFS_MNT}/home/chaos/.local/share/applications/firefox-esr.desktop"
-fi
+# Ensure Chromium is registered as default web browser
+mkdir -p "${ROOTFS_MNT}/etc/xdg"
+cat > "${ROOTFS_MNT}/etc/xdg/mimeapps.list" << 'EOF_MIME'
+[Default Applications]
+text/html=chromium.desktop
+x-scheme-handler/http=chromium.desktop
+x-scheme-handler/https=chromium.desktop
+x-scheme-handler/about=chromium.desktop
+x-scheme-handler/unknown=chromium.desktop
+EOF_MIME
+
+rm -f "${ROOTFS_MNT}/home/chaos/.local/bin/firefox-pwcam" \
+      "${ROOTFS_MNT}/home/chaos/.local/share/applications/firefox-esr.desktop" 2>/dev/null || true
 
 chroot "${ROOTFS_MNT}" chown -R chaos:chaos \
     /home/chaos/.local/bin/chromium-pwcam \
-    /home/chaos/.local/bin/firefox-pwcam \
     /home/chaos/.local/share/applications || true
 
 # Power key behavior is handled by rk-powerkey-longpress service:
@@ -2808,6 +2967,61 @@ RK_POWERKEY_LONGPRESS_UNIT
 mkdir -p "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants"
 ln -sf /etc/systemd/system/rk-powerkey-longpress.service \
     "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants/rk-powerkey-longpress.service"
+
+cat > "${ROOTFS_MNT}/usr/local/sbin/rk-virtual-keyboard.py" << 'RK_VIRTUAL_KEYBOARD'
+#!/usr/bin/env python3
+"""Persistent virtual keyboard device for Wayland seats.
+Ensures phoc/wlroots advertises keyboard capability so Chromium
+and other Ozone/Wayland apps do not crash on text input.
+"""
+import signal
+import sys
+import time
+from evdev import UInput, ecodes as e
+
+keys = [
+    e.KEY_ESC, e.KEY_1, e.KEY_2, e.KEY_3, e.KEY_4, e.KEY_5, e.KEY_6, e.KEY_7, e.KEY_8, e.KEY_9, e.KEY_0,
+    e.KEY_MINUS, e.KEY_EQUAL, e.KEY_BACKSPACE, e.KEY_TAB, e.KEY_Q, e.KEY_W, e.KEY_E, e.KEY_R, e.KEY_T,
+    e.KEY_Y, e.KEY_U, e.KEY_I, e.KEY_O, e.KEY_P, e.KEY_LEFTBRACE, e.KEY_RIGHTBRACE, e.KEY_ENTER,
+    e.KEY_LEFTCTRL, e.KEY_A, e.KEY_S, e.KEY_D, e.KEY_F, e.KEY_G, e.KEY_H, e.KEY_J, e.KEY_K, e.KEY_L,
+    e.KEY_SEMICOLON, e.KEY_APOSTROPHE, e.KEY_GRAVE, e.KEY_LEFTSHIFT, e.KEY_BACKSLASH, e.KEY_Z, e.KEY_X,
+    e.KEY_C, e.KEY_V, e.KEY_B, e.KEY_N, e.KEY_M, e.KEY_COMMA, e.KEY_DOT, e.KEY_SLASH, e.KEY_RIGHTSHIFT,
+    e.KEY_LEFTALT, e.KEY_SPACE, e.KEY_CAPSLOCK, e.KEY_LEFTMETA
+]
+
+ui = UInput({e.EV_KEY: keys}, name="rk-virtual-keyboard")
+
+def handle_sig(sig, frame):
+    ui.close()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_sig)
+signal.signal(signal.SIGINT, handle_sig)
+
+while True:
+    time.sleep(3600)
+RK_VIRTUAL_KEYBOARD
+chmod +x "${ROOTFS_MNT}/usr/local/sbin/rk-virtual-keyboard.py"
+
+cat > "${ROOTFS_MNT}/etc/systemd/system/rk-virtual-keyboard.service" << 'RK_VIRTUAL_KEYBOARD_UNIT'
+[Unit]
+Description=Persistent Virtual Keyboard for Wayland Seat
+After=systemd-udev-settle.service local-fs.target
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/rk-virtual-keyboard.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+RK_VIRTUAL_KEYBOARD_UNIT
+
+mkdir -p "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants"
+ln -sf /etc/systemd/system/rk-virtual-keyboard.service \
+    "${ROOTFS_MNT}/etc/systemd/system/multi-user.target.wants/rk-virtual-keyboard.service"
 
 echo "[*] Adding polkit rule for backlight control..."
 mkdir -p "${ROOTFS_MNT}/etc/polkit-1/rules.d"
@@ -4063,16 +4277,9 @@ exec /usr/local/sbin/rk-audio-resume.sh "$@"
 RK_AUDIO_RESUME_SLEEP
 chmod +x "${ROOTFS_MNT}/lib/systemd/system-sleep/rk-audio-resume"
 
-# 10. USB role manager service (OTG host + charging)
-if [ -f "${ROOT_DIR}/overlay/usb-mode-switch.sh" ] && [ -f "${ROOT_DIR}/overlay/usb-role-manager.service" ]; then
-    echo "[*] Installing USB role manager service..."
-    cp "${ROOT_DIR}/overlay/usb-mode-switch.sh" "${ROOTFS_MNT}/usr/local/bin/usb-mode-switch.sh"
-    chmod +x "${ROOTFS_MNT}/usr/local/bin/usb-mode-switch.sh"
-    cp "${ROOT_DIR}/overlay/usb-role-manager.service" "${ROOTFS_MNT}/etc/systemd/system/usb-role-manager.service"
-    # Clean up deprecated services that caused one-sided behavior.
-    chroot "${ROOTFS_MNT}" systemctl disable usb-force-host.service usb-otg-host.service >/dev/null 2>&1 || true
-    chroot "${ROOTFS_MNT}" systemctl enable usb-role-manager.service
-fi
+# 10. Clean up deprecated USB role switch services (kernel handles OTG/charging natively)
+chroot "${ROOTFS_MNT}" systemctl disable usb-role-manager.service usb-force-host.service usb-otg-host.service >/dev/null 2>&1 || true
+
 
 # 10b. Front camera ISP setup service (s5k5e8 → rkisp → /dev/video23)
 if [ -f "${ROOT_DIR}/overlay/camera-isp-setup.sh" ] && \
@@ -4160,6 +4367,12 @@ for policy in /sys/devices/system/cpu/cpufreq/policy*; do
     [ -f "\$policy/scaling_governor" ] || continue
     echo "\$CPU_GOVERNOR" > "\$policy/scaling_governor" 2>/dev/null || true
 done
+
+# Pin memory controller (DMC) to performance (920 MHz) to avoid scanout bus faults
+for d in /sys/class/devfreq/*dmc* /sys/class/devfreq/dmc; do
+    [ -d "\$d" ] || continue
+    echo performance > "\$d/governor" 2>/dev/null || true
+done
 RK_POWER_TUNE
 chmod +x "${ROOTFS_MNT}/usr/local/sbin/rk-power-tune.sh"
 
@@ -4178,6 +4391,18 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 RK_POWER_TUNE_UNIT
 chroot "${ROOTFS_MNT}" systemctl enable rk-power-tune.service
+
+# Pin DDR frequency service before display manager
+if [ -f "${ROOT_DIR}/overlay/rk-dmc-pin.sh" ] && \
+   [ -f "${ROOT_DIR}/overlay/rk-dmc-pin.service" ]; then
+    echo "[*] Installing DDR frequency pin service..."
+    cp "${ROOT_DIR}/overlay/rk-dmc-pin.sh" "${ROOTFS_MNT}/usr/local/sbin/rk-dmc-pin.sh"
+    chmod 0755 "${ROOTFS_MNT}/usr/local/sbin/rk-dmc-pin.sh"
+    cp "${ROOT_DIR}/overlay/rk-dmc-pin.service" \
+       "${ROOTFS_MNT}/etc/systemd/system/rk-dmc-pin.service"
+    chmod 0644 "${ROOTFS_MNT}/etc/systemd/system/rk-dmc-pin.service"
+    chroot "${ROOTFS_MNT}" systemctl enable rk-dmc-pin.service || true
+fi
 
 # Map power-profiles-daemon profiles to cpufreq behavior so Phosh's
 # "Balanced" and "Power Saver" switch directly controls CPU policy.
@@ -4359,8 +4584,8 @@ chmod +x "${ROOTFS_MNT}/usr/local/sbin/rk-power-profile-sync.sh"
 cat > "${ROOTFS_MNT}/etc/systemd/system/rk-power-profile-sync.service" << 'RK_POWER_PROFILE_SYNC_UNIT'
 [Unit]
 Description=Sync CPU governor/frequency caps with Power Profiles mode
-After=power-profiles-daemon.service rk-power-tune.service
-Wants=power-profiles-daemon.service rk-power-tune.service
+After=rk-power-tune.service
+Wants=rk-power-tune.service
 
 [Service]
 Type=simple
